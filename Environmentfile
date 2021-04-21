@@ -8,14 +8,14 @@ using System.Xml.Linq;
 using Microsoft.Practices.Unity;
 using TechTalk.SpecFlow;
 
-namespace Trizetto.CareAdvance.Automation.Tests.Infrastructure.Configuration
+namespace TShirtShopping
 {
     /// <summary>
     /// A manager for run time settings and test data.
     /// </summary>
     public class ConfigManager : ConfigElement, IConfigManager
     {
-        private const string ConfigNamespaceUri = "http://schemas.trizetto.com/2014/03/06/TestConfig.xsd";
+        private const string ConfigNamespaceUri = "";
         private const string ConfigDefaultElementName = "Config";
         private const string ConfigEnvironmentElementName = "EnvironmentConfig";
         private const string ConfigMatchesElementName = "Matches";
