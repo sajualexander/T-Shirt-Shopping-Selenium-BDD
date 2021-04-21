@@ -1,0 +1,336 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
+using Microsoft.Practices.Unity;
+using TechTalk.SpecFlow;
+
+namespace Trizetto.CareAdvance.Automation.Tests.Infrastructure.Configuration
+{
+    /// <summary>
+    /// A manager for run time settings and test data.
+    /// </summary>
+    public class ConfigManager : ConfigElement, IConfigManager
+    {
+        private const string ConfigNamespaceUri = "http://schemas.trizetto.com/2014/03/06/TestConfig.xsd";
+        private const string ConfigDefaultElementName = "Config";
+        private const string ConfigEnvironmentElementName = "EnvironmentConfig";
+        private const string ConfigMatchesElementName = "Matches";
+        private const string ConfigEnvironmentNameAttributeName = "name";
+        private const string ConfigEnvironmentEnabledAttributeName = "enabled";
+        private const string ConfigMergeKeyAttributeName = "key";
+        private const string ConfigMergeRemoveAttributeName = "remove";
+        private const string ConfigMergeRemoveAttrAttributeName = "removeAttr";
+        private const string ConfigMergeClearAttributeName = "clear";
+        private const string ConfigMergeFinalAttributeName = "final";
+
+        /// <summary>
+        /// Keeps the name of the runtime environment.
+        /// </summary>
+        private readonly string _runtimeEnvironment;
+
+        /// <summary>
+        /// A helper property return the current feature configuration.
+        /// </summary>
+        public static IConfigElement Current
+        {
+            get
+            {
+                if (FeatureContext.Current == null)
+                {
+                    throw new InvalidOperationException("Runtime is not configured");
+                }
+                IUnityContainer container;
+                if (!FeatureContext.Current.TryGetValue(out container))
+                {
+                    throw new InvalidOperationException("Runtime is not configured");
+                }
+                return container.Resolve<IConfigManager>();
+            }
+        }
+
+        /// <summary>
+        /// Creates a new instance.
+        /// </summary>
+        /// <param name="runtimeConfig"></param>
+        /// <param name="runtimeEnvironment"></param>
+        /// <param name="resolver"></param>
+        public ConfigManager(string runtimeConfig, string runtimeEnvironment, IConfigValueResolver resolver)
+            : base(new XDocument(new XElement(BuildConfigNamespaceName(ConfigDefaultElementName))).Root, resolver)
+        {
+            if (runtimeConfig == null)
+            {
+                throw new ArgumentNullException("runtimeConfig");
+            }
+            if (runtimeEnvironment == null)
+            {
+                throw new ArgumentNullException("runtimeEnvironment");
+            }
+            _runtimeEnvironment = runtimeEnvironment;
+            LoadDocument(runtimeConfig);
+        }
+
+        /// <summary>
+        /// Loads a document and merges the data into the current document.
+        /// </summary>
+        /// <param name="fileName"></param>
+        public void LoadDocument(string fileName)
+        {
+            if (fileName == null)
+            {
+                throw new ArgumentNullException("fileName");
+            }
+            var fullPath = GetAbsolutePath(fileName);
+            using (var reader = XmlReader.Create(fullPath))
+            {
+                try
+                {
+                    LoadDocument(reader);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidDataException(String.Format("Cannot load configuration file: {0}", fullPath), ex);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Formats fully qualified name and returns as XName.
+        /// </summary>
+        /// <param name="localName"></param>
+        /// <returns></returns>
+        private static XName BuildConfigNamespaceName(string localName)
+        {
+            return string.Format("{{{0}}}{1}", ConfigNamespaceUri, localName);
+        }
+
+        /// <summary>
+        /// Loads a document and merges the data into the current document.
+        /// </summary>
+        /// <param name="reader"></param>
+        public void LoadDocument(XmlReader reader)
+        {
+            if (reader == null)
+            {
+                throw new ArgumentNullException("reader");
+            }
+            var document = XDocument.Load(reader);
+
+            // get configuration defaults of this document
+            var defaultConfig = document.Root;
+            if (defaultConfig == null)
+            {
+                throw new InvalidDataException("Cannot find the root element");
+            }
+            Debug.Assert(defaultConfig.Name != null);
+            if (defaultConfig.Name != BuildConfigNamespaceName(ConfigDefaultElementName))
+            {
+                throw new InvalidDataException("Unexpected root element name");
+            }
+
+            // apply environment overrides, find valid and enabled
+            var environmentConfigs = defaultConfig.Elements().Where(
+                e => e.Name == BuildConfigNamespaceName(ConfigEnvironmentElementName)
+                     && e.Attribute(ConfigEnvironmentNameAttributeName) != null
+                     && (e.Attribute(ConfigEnvironmentEnabledAttributeName) == null ||
+                        Convert.ToBoolean(e.Attribute(ConfigEnvironmentEnabledAttributeName).Value)));
+
+            foreach (var overrideConfig in environmentConfigs)
+            {
+                var overrideName = overrideConfig.Attribute(ConfigEnvironmentNameAttributeName).Value;
+                // check for c:Matches elements and use them for matching
+                if (overrideConfig.Elements(BuildConfigNamespaceName(ConfigMatchesElementName)).Any())
+                {
+                    if (!overrideConfig.Elements(BuildConfigNamespaceName(ConfigMatchesElementName))
+                        .Any(e => e.Attribute(ConfigEnvironmentNameAttributeName) != null &&
+                            Regex.IsMatch(_runtimeEnvironment, e.Attribute(ConfigEnvironmentNameAttributeName).Value, RegexOptions.IgnoreCase)))
+                    {
+                        continue;
+                    }
+                }
+                // otherwise use simple match by name
+                else if (!_runtimeEnvironment.StartsWith(overrideName, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                try
+                {
+                    // make sure the override do not have an instruction 
+                    // to delete all the configuration by mistake
+                    var removeAttr = overrideConfig.Attribute(BuildConfigNamespaceName(ConfigMergeRemoveAttributeName));
+                    if (removeAttr != null && Convert.ToBoolean(removeAttr.Value))
+                    {
+                        throw new InvalidDataException("The root element cannot be removed");
+                    }
+                    MergeElements(defaultConfig, overrideConfig, true);
+                }
+                catch (Exception ex)
+                {
+                    throw new InvalidDataException(String.Format("Cannot apply overrides for environment prefix: {0}", overrideName), ex);
+                }
+            }
+
+            // remove all environment configs from the resulting document
+            foreach (var removeConfig in defaultConfig.Elements(BuildConfigNamespaceName(ConfigEnvironmentElementName)).ToArray())
+            {
+                removeConfig.Remove();
+            }
+
+            // as the last step, merge the loaded document with the previous configuration
+            MergeElements(_configElement, defaultConfig, false);
+        }
+
+        /// <summary>
+        /// Merges two XML elements.
+        /// </summary>
+        /// <param name="sourceElement"></param>
+        /// <param name="overrideElement"></param>
+        /// <param name="ignoreFinal"></param>
+        private void MergeElements(XElement sourceElement, XElement overrideElement, bool ignoreFinal)
+        {
+            if (!ignoreFinal)
+            {
+                // check if the source element is protected
+                var finalAttr = sourceElement.Attribute(BuildConfigNamespaceName(ConfigMergeFinalAttributeName));
+                if (finalAttr != null && Convert.ToBoolean(finalAttr.Value))
+                {
+                    throw new InvalidDataException(String.Format("Cannot override protected element: {0}",
+                        sourceElement.Name));
+                }
+            }
+
+            // check if the source node should be removed
+            var removeAttr = overrideElement.Attribute(BuildConfigNamespaceName(ConfigMergeRemoveAttributeName));
+            if (removeAttr != null && Convert.ToBoolean(removeAttr.Value))
+            {
+                // verify that no descending elements are protected
+                if (!ignoreFinal && sourceElement.Descendants()
+                    .Any(e => e.Attribute(BuildConfigNamespaceName(ConfigMergeFinalAttributeName)) != null
+                        && Convert.ToBoolean(e.Attribute(BuildConfigNamespaceName(ConfigMergeFinalAttributeName)).Value)))
+                {
+                    throw new InvalidDataException(String.Format("Cannot remove an element that has protected descendants: {0}", sourceElement.Name));
+                }
+                sourceElement.Remove();
+                return;
+            }
+
+            // merge attributes (including c:key if exists)
+            MergeAttributes(sourceElement, overrideElement);
+
+            // check if the override element has an instruction to remove all 
+            // children of the source element before merging
+            var clearAttr = overrideElement.Attribute(BuildConfigNamespaceName(ConfigMergeClearAttributeName));
+            if (clearAttr != null && Convert.ToBoolean(clearAttr.Value))
+            {
+                // verify that no descending elements are protected
+                if (!ignoreFinal && sourceElement.Descendants()
+                    .Any(e => e.Attribute(BuildConfigNamespaceName(ConfigMergeFinalAttributeName)) != null
+                        && Convert.ToBoolean(e.Attribute(BuildConfigNamespaceName(ConfigMergeFinalAttributeName)).Value)))
+                {
+                    throw new InvalidDataException(String.Format("Cannot clear an element that has protected descendants: {0}", sourceElement.Name));
+                }
+                sourceElement.RemoveNodes();
+            }
+
+            // if both source and override element do not have elements,
+            // merge their text values by overriding the source value.
+            if (!sourceElement.HasElements && !overrideElement.HasElements)
+            {
+                sourceElement.Value = overrideElement.Value;
+                return;
+            }
+
+            // otherwise, merge child elements
+            var mergeKey = sourceElement.Attribute(BuildConfigNamespaceName(ConfigMergeKeyAttributeName)) != null
+                ? sourceElement.Attribute(BuildConfigNamespaceName(ConfigMergeKeyAttributeName)).Value
+                : null;
+
+            foreach (var overrideChild in overrideElement.Elements())
+            {
+                if (overrideChild.Name.NamespaceName == ConfigNamespaceUri)
+                {
+                    continue;
+                }
+                XElement sourceChild;
+                if (!string.IsNullOrEmpty(mergeKey))
+                {
+                    var overrideKey = overrideChild.Attribute(mergeKey);
+                    if (overrideKey == null)
+                    {
+                        throw new InvalidDataException(String.Format("Element '{0}' does not have a required key attribute '{1}'", overrideChild.Name, mergeKey));
+                    }
+                    sourceChild = sourceElement.Elements(overrideChild.Name).FirstOrDefault(e => e.Attribute(mergeKey) != null && e.Attribute(mergeKey).Value == overrideKey.Value);
+                }
+                else
+                {
+                    sourceChild = sourceElement.Elements(overrideChild.Name).FirstOrDefault();
+                }
+                if (sourceChild != null)
+                {
+                    MergeElements(sourceChild, overrideChild, ignoreFinal);
+                    continue;
+                }
+                sourceElement.Add(new XElement(overrideChild));
+            }
+        }
+
+        /// <summary>
+        /// Merges attributes of XML elements. 
+        /// </summary>
+        /// <param name="sourceElement"></param>
+        /// <param name="overrideElement"></param>
+        private void MergeAttributes(XElement sourceElement, XElement overrideElement)
+        {
+            // check if override element has an instruction to delete one or more attributes of the source element
+            var removeAttrAttr = overrideElement.Attribute(BuildConfigNamespaceName(ConfigMergeRemoveAttrAttributeName));
+            if (removeAttrAttr != null)
+            {
+                var attrList = removeAttrAttr.Value.Split(new[] { " " }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var sourceAttr in attrList.Select(attrName => sourceElement.Attribute(attrName))
+                    .Where(sourceAttr => sourceAttr != null && sourceAttr.Name.NamespaceName != ConfigNamespaceUri))
+                {
+                    sourceAttr.Remove();
+                }
+            }
+
+            // update all attributes
+            foreach (var overrideAttr in overrideElement.Attributes())
+            {
+                // ignore all c:* attributes but c:key and c:final
+                if (overrideAttr.Name.NamespaceName == ConfigNamespaceUri
+                    && overrideAttr.Name.LocalName != ConfigMergeFinalAttributeName
+                    && overrideAttr.Name.LocalName != ConfigMergeKeyAttributeName)
+                {
+                    continue;
+                }
+                sourceElement.SetAttributeValue(overrideAttr.Name, overrideAttr.Value);
+            }
+        }
+
+        /// <summary>
+        /// Gets the absolute path for a file name.
+        /// </summary>
+        /// <param name="fileName"></param>
+        /// <returns></returns>
+        private static string GetAbsolutePath(string fileName)
+        {
+            Debug.Assert(fileName != null);
+            return !Path.IsPathRooted(fileName)
+                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName)
+                : fileName;
+        }
+
+        /// <summary>
+        /// Gets the value of the current element as a string.
+        /// </summary>
+        /// <returns></returns>
+        public override string GetValue()
+        {
+            throw new InvalidOperationException("This operation cannot be executed on the configuration document.");
+        }
+
+    }
+}
